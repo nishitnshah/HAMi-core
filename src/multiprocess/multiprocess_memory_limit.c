@@ -23,7 +23,7 @@
 
 
 #ifndef SEM_WAIT_TIME
-#define SEM_WAIT_TIME 10
+#define SEM_WAIT_TIME 1
 #endif
 
 #ifndef SEM_WAIT_TIME_ON_EXIT
@@ -31,7 +31,7 @@
 #endif
 
 #ifndef SEM_WAIT_RETRY_TIMES
-#define SEM_WAIT_RETRY_TIMES 30
+#define SEM_WAIT_RETRY_TIMES 5
 #endif
 
 int pidfound;
@@ -479,10 +479,12 @@ void exit_handler() {
 
 void lock_shrreg() {
     struct timespec sem_ts;
-    get_timespec(SEM_WAIT_TIME, &sem_ts);
     shared_region_t* region = region_info.shared_region;
     int trials = 0;
+    int wait_time = SEM_WAIT_TIME;  // Start with base timeout
+
     while (1) {
+        get_timespec(wait_time, &sem_ts);
         int status = sem_timedwait(&region->sem, &sem_ts);
         SEQ_POINT_MARK(SEQ_ACQUIRE_SEMLOCK_OK);
 
@@ -494,7 +496,8 @@ void lock_shrreg() {
             trials = 0;
             break;
         } else if (errno == ETIMEDOUT) {
-            LOG_WARN("Lock shrreg timeout, try fix (%d:%ld)", region_info.pid,region->owner_pid);
+            LOG_WARN("Lock shrreg timeout (trial %d, wait %ds), try fix (%d:%ld)",
+                     trials, wait_time, region_info.pid, region->owner_pid);
             int32_t current_owner = region->owner_pid;
             if (current_owner != 0 && (current_owner == region_info.pid ||
                     proc_alive(current_owner) == PROC_STATE_NONALIVE)) {
@@ -505,16 +508,17 @@ void lock_shrreg() {
             } else {
                 trials++;
                 if (trials > SEM_WAIT_RETRY_TIMES) {
-                    LOG_WARN("Fail to lock shrreg in %d seconds",
-                        SEM_WAIT_RETRY_TIMES * SEM_WAIT_TIME);
+                    LOG_WARN("Fail to lock shrreg after %d trials", SEM_WAIT_RETRY_TIMES);
                     if (current_owner == 0) {
                         LOG_WARN("fix current_owner 0>%d",region_info.pid);
                         region->owner_pid = region_info.pid;
                         if (0 == fix_lock_shrreg()) {
                             break;
-                        } 
+                        }
                     }
                 }
+                // Exponential backoff: 1s, 2s, 2s, 2s, 2s (cap at 2s)
+                wait_time = (wait_time < 2) ? wait_time * 2 : 2;
                 continue;  // slow wait path
             }
         } else {
@@ -561,6 +565,9 @@ int clear_proc_slot_nolock(int do_clear) {
 
 void init_proc_slot_withlock() {
     int32_t current_pid = getpid();
+    // Add random jitter (0-50ms) to stagger simultaneous process starts
+    srand(time(NULL) ^ current_pid);
+    usleep((rand() % 50) * 1000);
     lock_shrreg();
     shared_region_t* region = region_info.shared_region;
     if (region->proc_num >= SHARED_REGION_MAX_PROCESS_NUM) {
