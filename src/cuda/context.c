@@ -4,6 +4,58 @@
 extern size_t context_size;
 extern int ctx_activate[16];
 
+/*
+ * CUDA context scheduling fix for multi-pod GPU sharing.
+ *
+ * Problem:
+ *   With CU_CTX_SCHED_AUTO (flags=0x00, the default), the CUDA driver
+ *   automatically switches from spin-polling to OS-blocking (BLOCKING_SYNC)
+ *   when it detects multiple processes sharing the same GPU. With 2 pods x 8
+ *   ranks = 16 processes, AUTO degrades every cudaStreamSynchronize from ~4µs
+ *   to ~257µs — even when the GPU kernel completed in 2µs. This causes a 3x
+ *   training throughput regression when two pods share the same 8 H100s.
+ *
+ * Fix:
+ *   Force CU_CTX_SCHED_SPIN on every context at creation time. HAMi intercepts
+ *   all context creation calls (cuCtxCreate_v2, cuCtxCreate_v3,
+ *   cuDevicePrimaryCtxSetFlags_v2), including those from NCCL and PyTorch
+ *   internals, so this applies universally.
+ *
+ *   CU_CTX_SCHED_SPIN = 0x01: CPU spin-polls for GPU completion, returning
+ *   immediately when done regardless of how many processes share the GPU.
+ *   Tradeoff: higher CPU utilization during GPU waits, acceptable for
+ *   GPU-bound training workloads.
+ *
+ * Opt-out:
+ *   Set HAMI_CTX_SCHED_SPIN=0 in the environment to disable and restore the
+ *   driver's default AUTO behavior (useful for CPU-bound inference workloads
+ *   that prefer to yield the CPU while waiting for long GPU operations).
+ */
+#define CU_CTX_SCHED_MASK 0x07u
+#define CU_CTX_SCHED_SPIN 0x01u
+
+static int hami_force_spin = -1;  /* -1 = uninitialized */
+
+static int should_force_spin() {
+    if (hami_force_spin == -1) {
+        const char *env = getenv("HAMI_CTX_SCHED_SPIN");
+        /* Default ON: force spin unless explicitly disabled */
+        hami_force_spin = (env == NULL || env[0] != '0') ? 1 : 0;
+        if (hami_force_spin)
+            LOG_INFO("HAMi: forcing CU_CTX_SCHED_SPIN on all contexts "
+                     "(set HAMI_CTX_SCHED_SPIN=0 to disable)");
+        else
+            LOG_INFO("HAMi: CU_CTX_SCHED_SPIN disabled via HAMI_CTX_SCHED_SPIN=0");
+    }
+    return hami_force_spin;
+}
+
+static unsigned int apply_spin_flag(unsigned int flags) {
+    if (!should_force_spin())
+        return flags;
+    return (flags & ~CU_CTX_SCHED_MASK) | CU_CTX_SCHED_SPIN;
+}
+
 
 CUresult cuDevicePrimaryCtxGetState( CUdevice dev, unsigned int* flags, int* active ){
     LOG_DEBUG("into cuDevicePrimaryCtxGetState dev=%d",dev);
@@ -16,7 +68,7 @@ CUresult cuDevicePrimaryCtxRetain(CUcontext *pctx, CUdevice dev){
     //for Initialization only
     CUresult res = CUDA_OVERRIDE_CALL(cuda_library_entry,cuDevicePrimaryCtxRetain,pctx,dev);
     if (ctx_activate[dev] == 0) {
-        add_gpu_device_memory_usage(getpid(),dev,context_size,0); 
+        add_gpu_device_memory_usage(getpid(),dev,context_size,0);
     }
     if (context_size>0) {
         ctx_activate[dev] = 1;
@@ -25,7 +77,8 @@ CUresult cuDevicePrimaryCtxRetain(CUcontext *pctx, CUdevice dev){
 }
 
 
-CUresult cuDevicePrimaryCtxSetFlags_v2( CUdevice dev, unsigned int  flags ){
+CUresult cuDevicePrimaryCtxSetFlags_v2( CUdevice dev, unsigned int flags ){
+    flags = apply_spin_flag(flags);
     LOG_DEBUG("into cuDevicePrimaryCtxSetFlags dev=%d flags=%d",dev,flags);
     return CUDA_OVERRIDE_CALL(cuda_library_entry,cuDevicePrimaryCtxSetFlags_v2,dev,flags);
 }
@@ -44,13 +97,15 @@ CUresult cuCtxGetDevice(CUdevice* device) {
     return res;
 }
 
-CUresult cuCtxCreate_v2 ( CUcontext* pctx, unsigned int  flags, CUdevice dev ){
+CUresult cuCtxCreate_v2 ( CUcontext* pctx, unsigned int flags, CUdevice dev ){
+    flags = apply_spin_flag(flags);
     LOG_DEBUG("into cuCtxCreate pctx=%p flags=%d dev=%d",pctx,flags,dev);
     CUresult res = CUDA_OVERRIDE_CALL(cuda_library_entry,cuCtxCreate_v2,pctx,flags,dev);
     return res;
 }
 
-CUresult cuCtxCreate_v3 ( CUcontext* pctx, CUexecAffinityParam* paramsArray, int  numParams, unsigned int  flags, CUdevice dev ){
+CUresult cuCtxCreate_v3 ( CUcontext* pctx, CUexecAffinityParam* paramsArray, int numParams, unsigned int flags, CUdevice dev ){
+    flags = apply_spin_flag(flags);
     LOG_DEBUG("into cuCtxCreate_v3 pctx=%p paramsArray=%p numParams=%d flags=%d dev=%d",pctx,paramsArray,numParams,flags,dev);
     CUresult res = CUDA_OVERRIDE_CALL(cuda_library_entry,cuCtxCreate_v3,pctx,paramsArray,numParams,flags,dev);
     return res;
@@ -141,4 +196,3 @@ CUresult cuCtxSynchronize ( void ){
     CUresult res = CUDA_OVERRIDE_CALL(cuda_library_entry,cuCtxSynchronize);
     return res;
 }
-
