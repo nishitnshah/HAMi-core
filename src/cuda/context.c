@@ -41,11 +41,11 @@ static int should_force_spin() {
         const char *env = getenv("HAMI_CTX_SCHED_SPIN");
         /* Default ON: force spin unless explicitly disabled */
         hami_force_spin = (env == NULL || env[0] != '0') ? 1 : 0;
-        if (hami_force_spin)
-            LOG_INFO("HAMi: forcing CU_CTX_SCHED_SPIN on all contexts "
-                     "(set HAMI_CTX_SCHED_SPIN=0 to disable)");
-        else
+        if (hami_force_spin) {
+            LOG_INFO("HAMi: forcing CU_CTX_SCHED_SPIN on all contexts (set HAMI_CTX_SCHED_SPIN=0 to disable)");
+        } else {
             LOG_INFO("HAMi: CU_CTX_SCHED_SPIN disabled via HAMI_CTX_SCHED_SPIN=0");
+        }
     }
     return hami_force_spin;
 }
