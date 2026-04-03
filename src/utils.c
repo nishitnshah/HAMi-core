@@ -129,13 +129,22 @@ nvmlReturn_t set_task_pid() {
     previous = merged_num;
     merged_num = 0;
     memset(tmp_pids_on_device,0,sizeof(nvmlProcessInfo_v1_t)*SHARED_REGION_MAX_PROCESS_NUM);
-    CHECK_CU_RESULT(cuDevicePrimaryCtxRetain(&pctx,0));
+    /* Use this rank's own GPU device rather than hardcoded GPU 0.
+     * Previously all ranks called cuDevicePrimaryCtxRetain(GPU 0), which:
+     * 1) Pre-activated GPU 0's primary context before our SPIN flag hook ran,
+     *    causing SPIN setup to fail silently for rank 0's training context.
+     * 2) Was semantically wrong — each rank should only touch its own GPU
+     *    when enumerating running processes to identify its host PID. */
+    CUdevice current_dev = 0;
+    cuCtxGetDevice(&current_dev);
+    LOG_INFO("set_task_pid: using device %d (was hardcoded 0)", current_dev);
+    CHECK_CU_RESULT(cuDevicePrimaryCtxRetain(&pctx, current_dev));
     for (i=0;i<nvmlCounts;i++) {
         cudaDev=nvml_to_cuda_map(i);
         if (cudaDev<0) {
             continue;
         }
-        CHECK_NVML_API(nvmlDeviceGetHandleByIndex (i, &device)); 
+        CHECK_NVML_API(nvmlDeviceGetHandleByIndex (i, &device));
         do{
             res = nvmlDeviceGetComputeRunningProcesses(device, &running_processes, tmp_pids_on_device);
             if ((res != NVML_SUCCESS) && (res != NVML_ERROR_INSUFFICIENT_SIZE)) {
@@ -152,7 +161,7 @@ nvmlReturn_t set_task_pid() {
         LOG_INFO("current pid in use is %d %d",i,pids_on_device[i].pid);
         //tmp_pids_on_device[i].pid=0;
     }
-    unsigned int hostpid = getextrapid(previous,running_processes,pre_pids_on_device,pids_on_device); 
+    unsigned int hostpid = getextrapid(previous,running_processes,pre_pids_on_device,pids_on_device);
     if (hostpid==0) {
         LOG_ERROR("host pid is error!");
         return NVML_ERROR_DRIVER_NOT_LOADED;
@@ -162,12 +171,12 @@ nvmlReturn_t set_task_pid() {
         for (i=0;i<running_processes;i++) {
             if (pids_on_device[i].pid==hostpid) {
                 LOG_INFO("Primary Context Size==%lld",tmp_pids_on_device[i].usedGpuMemory);
-                context_size = tmp_pids_on_device[i].usedGpuMemory; 
+                context_size = tmp_pids_on_device[i].usedGpuMemory;
                 break;
             }
         }
     }
-    CHECK_CU_RESULT(cuDevicePrimaryCtxRelease(0));
+    CHECK_CU_RESULT(cuDevicePrimaryCtxRelease(current_dev));
     return NVML_SUCCESS; 
 }
 
