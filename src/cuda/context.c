@@ -65,7 +65,14 @@ CUresult cuDevicePrimaryCtxGetState( CUdevice dev, unsigned int* flags, int* act
 
 CUresult cuDevicePrimaryCtxRetain(CUcontext *pctx, CUdevice dev){
     LOG_INFO("dev=%d context_size=%ld",dev,context_size);
-    //for Initialization only
+    /* Force SPIN before activating the primary context.
+     * cuDevicePrimaryCtxSetFlags must be called before the primary context
+     * is active. Calling it here (before cuDevicePrimaryCtxRetain) ensures
+     * SPIN is set even when callers (PyTorch, NCCL) retain the primary
+     * context directly rather than going through cuCtxCreate. */
+    if (should_force_spin()) {
+        CUDA_OVERRIDE_CALL(cuda_library_entry,cuDevicePrimaryCtxSetFlags_v2,dev,CU_CTX_SCHED_SPIN);
+    }
     CUresult res = CUDA_OVERRIDE_CALL(cuda_library_entry,cuDevicePrimaryCtxRetain,pctx,dev);
     if (ctx_activate[dev] == 0) {
         add_gpu_device_memory_usage(getpid(),dev,context_size,0);
